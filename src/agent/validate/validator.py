@@ -122,6 +122,19 @@ def _rerun_probe(finding_row, client: EnforcingClient, db: Database | None = Non
         if db is None:
             return {"ok": False, "error": "chain re-run needs the database"}
         return _rerun_chain_probe(finding_row, client, db, rulebook)
+    if finding_row["vuln_type"] == "Stored XSS / URI scheme (probe)":
+        # re-POST the payloads and re-check the recorded render pages
+        from ..hunt.probes import probe_reflection_stored
+        check_urls = [c.get("url") for c in evidence.get("href_hits", [])]
+        check_urls += evidence.get("persisted_on", [])
+        if not check_urls:
+            return {"ok": False, "error": "stored-XSS evidence lists no render pages"}
+        try:
+            return probe_reflection_stored(
+                client, finding_row["url"], param, check_urls,
+                method=str(evidence.get("method", "POST")).upper())
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"stored probe error: {exc}"}
     map_entry = _PROBE_MAP.get(finding_row["vuln_type"])
     if map_entry is None:
         return {"ok": False, "error": "no deterministic probe for this type"}

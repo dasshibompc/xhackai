@@ -6,6 +6,7 @@ through the EnforcingClient; payloads are minimal and non-destructive.
 """
 from __future__ import annotations
 
+import json
 import time
 import urllib.parse
 from typing import TYPE_CHECKING, Any
@@ -318,6 +319,141 @@ def probe_sqli_oob(client: EnforcingClient, url: str, param: str,
     }
 
 
+def probe_filter_map(client: EnforcingClient, url: str, param: str) -> dict[str, Any]:
+    """WAF/filter mapping (M6b): discover which markup SURVIVES a filter by
+    string-level comparison. For each candidate tag/handler we send a benign
+    standalone value (e.g. '<svg>x') and check whether it comes back verbatim;
+    a stripped/encoded/truncated response means the filter ate it.
+
+    Output is an exact "allowed markup" map the hunter can use to craft a
+    context-appropriate payload — this is the 'some SVG markup allowed' class:
+    filters block script/img/onload but routinely miss svg/animate/onbegin.
+    String survival is a lower bound on exploitability, stated as such.
+    """
+    from .payloads import FILTER_SCAN_HANDLERS, FILTER_SCAN_TAGS
+
+    def _sends(value: str):
+        try:
+            return client.get(_inject(url, param, value))
+        except Exception:  # noqa: BLE001
+            return None
+
+    baseline = _sends("filteRmapBaseLine123")
+    if baseline is None:
+        return {"ok": False, "error": "baseline request failed"}
+
+    allowed_tags: list[str] = []
+    blocked_tags: list[str] = []
+    for tag in FILTER_SCAN_TAGS:
+        resp = _sends(f"<{tag}>filteRmapTag</{tag}>")
+        if resp is None:
+            continue
+        if f"<{tag}>" in resp.text:
+            allowed_tags.append(tag)
+        else:
+            blocked_tags.append(tag)
+
+    allowed_handlers: list[str] = []
+    blocked_handlers: list[str] = []
+    for handler in FILTER_SCAN_HANDLERS:
+        resp = _sends(f'<svg><a {handler}="filteRmapH">x</a></svg>')
+        if resp is None:
+            continue
+        if handler in resp.text.lower():
+            allowed_handlers.append(handler)
+        else:
+            blocked_handlers.append(handler)
+
+    return {
+        "ok": True,
+        "param": param,
+        "allowed_tags": allowed_tags,
+        "blocked_tags": blocked_tags,
+        "allowed_handlers": allowed_handlers,
+        "blocked_handlers": blocked_handlers,
+        "requests": 1 + len(FILTER_SCAN_TAGS) + len(FILTER_SCAN_HANDLERS),
+        "note": ("string-level survival; craft payloads from allowed_tags/"
+                 "allowed_handlers and verify context — survival alone is not "
+                 "execution proof"),
+    }
+
+
+def probe_reflection_stored(client: EnforcingClient, inject_url: str, param: str,
+                            check_urls: list[str], method: str = "POST",
+                            extra_fields: dict | None = None) -> dict[str, Any]:
+    """Stored XSS / URI-scheme probe (M6a).
+
+    Pattern (mirrors 'stored XSS into anchor href' labs and real comment
+    boards): POST the payload to inject_url, then RE-FETCH check_urls and look
+    for it persisting. Detection is two-tier:
+
+    - href/src danger: the payload value survives inside an anchor/img
+      attribute WITH a javascript:/data: scheme (STORED_HREF_RE) — directly
+      exploitable, strong signal;
+    - raw persistence: the unique marker appears verbatim in any refetched
+      page — stored injection point (context analysis still needed).
+
+    check_urls should include the page(s) where stored content renders. The
+    unique marker makes every hit attributable to this run.
+    """
+    from .payloads import STORED_HREF_RE, URI_SCHEME_PROBES
+    marker = fresh_marker()
+    note_marker = getattr(client, "note_marker", None)
+    if callable(note_marker):
+        note_marker(marker)
+
+    def _send(value: str):
+        if method.upper() == "POST":
+            return client.post(inject_url, data={param: value, **(extra_fields or {})})
+        return client.get(_inject(inject_url, param, value))
+
+    # inject every scheme payload (each embeds the same marker)
+    sent: list[str] = []
+    for template in URI_SCHEME_PROBES:
+        value = template.replace("{marker}", marker)
+        try:
+            _send(value)
+            sent.append(value)
+        except Exception:  # noqa: BLE001
+            continue
+
+    # re-fetch and inspect persisted renderings — hits are attributed to THIS
+    # run by requiring our marker near the scheme match (stale payloads from
+    # earlier runs/tests must not count as fresh evidence)
+    href_hits: list[dict] = []
+    raw_pages: list[str] = []
+    for page_url in check_urls:
+        try:
+            resp = client.get(page_url)
+        except Exception:  # noqa: BLE001
+            continue
+        body = resp.text
+        for m in STORED_HREF_RE.finditer(body):
+            window = body[m.start():m.start() + 300]
+            if marker in window:
+                href_hits.append({"url": page_url,
+                                  "note": "OUR javascript:/data: URI persisted in an href/src attribute"})
+                break
+        if marker in body:
+            raw_pages.append(page_url)
+
+    vulnerable = bool(href_hits or raw_pages)
+    return {
+        "ok": True,
+        "vulnerable": vulnerable,
+        "marker": marker,
+        "param": param,
+        "inject_url": inject_url,
+        "href_hits": href_hits,
+        "persisted_on": raw_pages,
+        "payloads_sent": len(sent),
+        "note": ("javascript:-scheme value persisted in an anchor attribute — "
+                 "stored XSS confirmed at detection level" if href_hits else
+                 "marker persisted verbatim — confirm HTML context on review"
+                 if raw_pages else "payload not persisted on any checked page"),
+    }
+
+
 # --------------------------------------------------------------------- tools
 
 class ProbeTool(Tool):
@@ -423,6 +559,65 @@ class SsrfProbeTool(ProbeTool):
         return self._store(url, param, ev)
 
 
+class FilterMapTool(Tool):
+    name = "probe_filter_map"
+    description = (
+        "Map a WAF/input filter: which HTML tags and event handlers SURVIVE in "
+        "the response? Use when a reflection exists but standard payloads "
+        "(script/img/onload) are stripped. Args: url, param. Returns allowed/"
+        "blocked lists — craft payloads from the allowed ones."
+    )
+    needs_client = True
+
+    def __init__(self, client: EnforcingClient, db: Database) -> None:
+        self.client = client
+        self.db = db
+
+    def run(self, url: str, param: str) -> ToolResult:
+        try:
+            res = probe_filter_map(self.client, url, param)
+        except AgentError as exc:
+            return ToolResult(False, str(exc))
+        if not res.get("ok"):
+            return ToolResult(False, str(res.get("error")))
+        return ToolResult(True, json.dumps({
+            "allowed_tags": res["allowed_tags"],
+            "blocked_tags": res["blocked_tags"],
+            "allowed_handlers": res["allowed_handlers"],
+            "blocked_handlers": res["blocked_handlers"],
+            "note": res["note"],
+        }))
+
+
+class StoredXssProbeTool(ProbeTool):
+    name = "probe_xss_stored"
+    description = (
+        "Test STORED XSS / URI-scheme injection: POST payloads (javascript: "
+        "URLs with a unique marker) to inject_url as param, then re-fetch "
+        "check_urls (comma-separated) to see where it persists. Args: "
+        "inject_url, param, check_urls [, method=POST] [, extra_fields JSON]."
+    )
+    probe_name = "Stored XSS / URI scheme (probe)"
+
+    def run(self, inject_url: str, param: str, check_urls: str,
+            method: str = "POST", extra_fields: str | None = None) -> ToolResult:
+        urls = [u.strip() for u in str(check_urls).split(",") if u.strip()]
+        if not urls:
+            return ToolResult(False, "check_urls needed (where stored content renders)")
+        fields: dict | None = None
+        if extra_fields:
+            try:
+                fields = json.loads(extra_fields)
+            except json.JSONDecodeError as exc:
+                return ToolResult(False, f"extra_fields not valid JSON: {exc}")
+        try:
+            ev = probe_reflection_stored(self.client, inject_url, param, urls,
+                                         method=method.upper(), extra_fields=fields)
+        except AgentError as exc:
+            return ToolResult(False, str(exc))
+        return self._store(inject_url, param, ev)
+
+
 class IdorProbeTool(ProbeTool):
     name = "probe_idor"
     description = ("Test whether an object URL like https://host/api/user/{id} "
@@ -442,7 +637,9 @@ def build_probe_tools(client: EnforcingClient, db: Database,
                       oob=None) -> dict[str, Tool]:
     """oob: an InteractshManager/FakeInteractshManager to attach to the probes
     that support OOB confirmation (M5b)."""
-    tools = [XssProbeTool(client, db), SqliProbeTool(client, db, oob=oob),
+    tools = [XssProbeTool(client, db), StoredXssProbeTool(client, db),
+             FilterMapTool(client, db),
+             SqliProbeTool(client, db, oob=oob),
              RedirectProbeTool(client, db), SsrfProbeTool(client, db, oob=oob),
              IdorProbeTool(client, db)]
     return {t.name: t for t in tools}

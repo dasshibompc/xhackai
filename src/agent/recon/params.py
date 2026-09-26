@@ -61,6 +61,18 @@ class _FormParser(HTMLParser):
             self._in_form = False
 
 
+def parse_html_links(html: str) -> list[str]:
+    """Absolute-ized hrefs from one HTML document (for crawl-follow mining)."""
+    from urllib.parse import urljoin
+    p = _FormParser()
+    try:
+        p.feed(html)
+    except Exception:  # noqa: BLE001
+        return []
+    return [urljoin("http://_rel_/", href) if not href.startswith(("http://", "https://"))
+            else href for href in p.links]
+
+
 def parse_html_params(html: str) -> tuple[set[str], set[str]]:
     """(form_field_names, link_query_param_names) from one HTML document."""
     p = _FormParser()
@@ -80,11 +92,17 @@ def parse_html_params(html: str) -> tuple[set[str], set[str]]:
 def mine_params(client: EnforcingClient, db: Database, rulebook: Rulebook,
                 max_pages: int = 25) -> dict:
     """Mine parameters from stored endpoints (page bodies fetched fresh) and
-    record them in the params table. Scope-checked like everything else."""
-    stats = {"pages": 0, "forms": 0, "query": 0, "mined": 0, "errors": 0}
+    record them in the params table. Scope-checked like everything else.
+
+    Crawl-follow: links discovered on fetched pages (same host, in scope) are
+    fetched too, up to max_pages total — the homepage alone hides most of the
+    real attack surface (deep pages carry their own forms and query params).
+    """
+    from urllib.parse import urljoin, urlsplit
+    stats = {"pages": 0, "forms": 0, "query": 0, "mined": 0, "errors": 0,
+             "followed": 0}
     rows = db.list_endpoints()
-    seen_hosts_pages: dict[str, int] = {}
-    candidates: list[str] = [
+    queue: list[str] = [
         r["url"] for r in rows
         if r["kind"] in ("link", "page") and r["url"].startswith(("http://", "https://"))
     ]
@@ -92,21 +110,12 @@ def mine_params(client: EnforcingClient, db: Database, rulebook: Rulebook,
     for r in db.conn.execute(
         "SELECT url FROM assets WHERE in_scope=1 AND url IS NOT NULL"
     ).fetchall():
-        candidates.append(r["url"])
-    for url in candidates[:max_pages]:
+        queue.append(r["url"])
+    fetched: set[str] = set()
+
+    def _harvest(url: str, html: str) -> None:
         host = urlsplit(url).hostname or ""
-        if not host or seen_hosts_pages.get(host, 0) >= max_pages:
-            continue
-        try:
-            resp = client.get(url)
-        except (OutOfScopeError, Exception):  # noqa: BLE001 — one bad page must not stop mining
-            stats["errors"] += 1
-            continue
-        if resp.status_code != 200 or "html" not in (resp.headers.get("content-type") or ""):
-            continue
-        forms, queries = parse_html_params(resp.text)
-        stats["pages"] += 1
-        seen_hosts_pages[host] = seen_hosts_pages.get(host, 0) + 1
+        forms, queries = parse_html_params(html)
         for name in forms:
             if name.lower() in _JUNK_NAMES:
                 continue
@@ -117,7 +126,46 @@ def mine_params(client: EnforcingClient, db: Database, rulebook: Rulebook,
                 continue
             if db.add_param(name, host, "query", source="mining", example_url=url):
                 stats["query"] += 1
-    # params already stored by xnLinkFinder stay visible; count them for the summary
+        stats["pages"] += 1
+
+    while queue and stats["pages"] < max_pages:
+        url = queue.pop(0).split("#")[0]
+        if url in fetched:
+            continue
+        fetched.add(url)
+        host = urlsplit(url).hostname or ""
+        if not host:
+            continue
+        try:
+            resp = client.get(url)
+        except OutOfScopeError:
+            continue  # links can point out of scope; skip silently
+        except Exception:  # noqa: BLE001 — one bad page must not stop mining
+            stats["errors"] += 1
+            continue
+        if resp.status_code != 200 or "html" not in (resp.headers.get("content-type") or ""):
+            continue
+        _harvest(url, resp.text)
+        # follow same-host, in-scope links (depth-1 crawl within the budget)
+        for href in parse_html_links(resp.text):
+            try:
+                abs_url = urljoin(url, href).split("#")[0]
+            except ValueError:
+                continue
+            if abs_url in fetched:
+                continue
+            try:
+                link_host = urlsplit(abs_url).hostname or ""
+            except ValueError:
+                continue
+            if link_host != host or not abs_url.startswith(("http://", "https://")):
+                continue
+            if not rulebook.check(abs_url)[0]:
+                continue
+            if abs_url not in queue and stats["pages"] + len(queue) < max_pages:
+                queue.append(abs_url)
+                db.add_endpoint(abs_url, "page", source="mining-crawl")
+                stats["followed"] += 1
     stats["mined"] = stats["forms"] + stats["query"]
     return stats
 

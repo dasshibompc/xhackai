@@ -29,6 +29,10 @@ M5c coverage pages:
 M5d chain endpoints (session auth, JSON API):
   POST /api/notes            — create a note (session user is owner)
   GET  /api/note/<id>        — owner only; ?debug=vuln skips ownership check
+
+M6a stored XSS: GET /comments renders a comment board; POST /comments with
+  author/message/website renders website VERBATIM inside href="..." —
+  the 'stored XSS into anchor href' pattern (javascript: scheme payload works).
 """
 from __future__ import annotations
 
@@ -51,6 +55,30 @@ _SESSION_LOCK = threading.Lock()
 _NOTES: dict[int, dict] = {}
 _NOTES_NEXT_ID = [5000]
 _NOTES_LOCK = threading.Lock()
+
+# M6a: comment board; website is rendered verbatim into href (vulnerable)
+_COMMENTS: list[dict] = []
+_COMMENTS_LOCK = threading.Lock()
+
+
+def COMMENTS_PAGE_HTML() -> str:
+    rows = []
+    with _COMMENTS_LOCK:
+        items = list(_COMMENTS)
+    for c in items:
+        rows.append(
+            f'<div class="comment"><b>{c["author"]}</b> '
+            f'<a href="{c["website"]}">website</a> '
+            f'<p>{c["message"]}</p></div>')
+    body = "".join(rows) or '<p>No comments yet.</p>'
+    return ("<!doctype html><html><head><title>Comments</title></head><body>"
+            "<h1>Comments</h1>" + body +
+            '<h2>Leave a comment</h2>'
+            '<form method="post" action="/comments">'
+            '<input name="author"><input name="website">'
+            '<textarea name="message"></textarea>'
+            '<button>post</button></form></body></html>')
+
 
 # M5c: form page — mining must extract these field names
 CONTACT_PAGE = """<!doctype html><html><head><title>Contact</title></head><body>
@@ -218,6 +246,9 @@ class LabHandler(BaseHTTPRequestHandler):
                                       " queue=ok cache=ok</pre>")
             return self._send(200, "<h1>Nothing to see here</h1>")
 
+        if u.path == "/comments":  # M6a: stored XSS board (href context)
+            return self._send(200, COMMENTS_PAGE_HTML())
+
         if u.path == "/admin":
             return self._send(403, "<h1>forbidden</h1>")
 
@@ -337,6 +368,15 @@ class LabHandler(BaseHTTPRequestHandler):
             body = f"<h1>Welcome {username}</h1><a href=\"/api/invoices\">your invoices</a>"
             self.wfile.write(body.encode())
             return None
+
+        if u.path == "/comments":  # M6a: store the comment verbatim (vulnerable)
+            author = params.get("author", ["anon"])[0][:60]
+            message = params.get("message", [""])[0][:300]
+            website = params.get("website", [""])[0][:300]
+            with _COMMENTS_LOCK:
+                _COMMENTS.append({"author": author, "message": message,
+                                  "website": website})
+            return self._send(302, "")
 
         user = params.get("username", [""])[0]
         password = params.get("password", [""])[0]

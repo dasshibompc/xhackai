@@ -78,6 +78,12 @@ class AgentLoop:
         final_summary = "max steps reached without finishing"
 
         for step in range(1, self.max_steps + 1):
+            if self.max_steps - step == 1:
+                # budget discipline: one step left — force a clean wrap-up
+                # instead of "max steps reached without finishing"
+                history += ("\n[system note] ONE STEP REMAINS. Reply with the "
+                            "finish action now: summarize what was tested, what "
+                            "was confirmed, and what needs another run.")
             try:
                 reply = self.provider.chat(system, history)
             except Exception as exc:  # noqa: BLE001 — provider down must not kill the run

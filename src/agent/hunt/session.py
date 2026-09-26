@@ -38,11 +38,19 @@ DISCOVERY_RULE = (
 
 CLASS_PROMPTS = {
     "xss": (
-        "You specialize in reflected XSS and template injection. For each target "
-        "parameter: send a benign baseline, then test reflection with the probe tool. "
-        "When the probe reports raw reflection, try to understand the HTML context "
-        "(fetch the page, inspect surrounding markup) and state what a real exploit "
-        "would require. Record a finding only for confirmed injection points."
+        "You specialize in reflected AND stored XSS and template injection. For "
+        "each target parameter: send a benign baseline, then test reflection "
+        "with probe_xss. When the probe reports raw reflection, try to understand "
+        "the HTML context (fetch the page, inspect surrounding markup) and state "
+        "what a real exploit would require. If reflection exists but probe_xss "
+        "finds nothing raw, the app likely FILTERS markup: call probe_filter_map "
+        "to learn which tags/handlers survive, then re-probe with payloads built "
+        "ONLY from allowed tags/handlers (e.g. svg/animate/onbegin). For content-"
+        "creating endpoints (comments, posts, profile fields), use probe_xss_stored: "
+        "POST javascript:-scheme payloads, then re-fetch the pages where that "
+        "content renders. If several parameters exist, test each — one negative "
+        "result is not the end of the session. Record a finding only for confirmed "
+        "injection points."
     ),
     "sqli": (
         "You specialize in SQL injection. Use probe_sqli on interesting parameters "
