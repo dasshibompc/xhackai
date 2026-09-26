@@ -33,21 +33,32 @@ GOOGLE_CHAIN = [
 
 
 def load_env_file(path: str | Path = ".env") -> None:
-    """Load KEY=VALUE pairs into os.environ (existing env vars win)."""
-    p = Path(path)
-    if not p.exists():
-        return
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    """Load KEY=VALUE pairs into os.environ (existing env vars win).
+
+    Searched in the working directory first, then up to three parent levels —
+    running from a repo subdirectory must not silently lose configuration.
+    """
+    name = Path(path).name
+    start = Path(path).resolve().parent
+    for candidate in (start, *start.parents[:3]):
+        env_file = candidate / name
+        if not env_file.exists():
             continue
-        key, val = line.split("=", 1)
-        os.environ.setdefault(key.strip(), val.strip())
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            os.environ.setdefault(key.strip(), val.strip())
+        return
 
 
-def _models_from_env() -> list[str]:
-    base = os.environ.get("AGENT_LLM_BASE_URL", "")
-    default_chain = GOOGLE_CHAIN if GOOGLE_BASE_MARKER in base else OPENROUTER_CHAIN
+def _models_from_env(base_url: str) -> list[str]:
+    """Model chain MUST match the endpoint actually in use: deriving it from
+    the resolved base_url (not a separate env read) makes a Google endpoint
+    with OpenRouter model names — or vice versa — impossible."""
+    default_chain = (GOOGLE_CHAIN if GOOGLE_BASE_MARKER in (base_url or "")
+                     else OPENROUTER_CHAIN)
     primary = os.environ.get("AGENT_LLM_MODEL")
     chain = list(default_chain) if primary is None else [primary]
     chain += [m for m in default_chain if m not in chain]
@@ -57,14 +68,16 @@ def _models_from_env() -> list[str]:
 class LLMProvider:
     def __init__(self) -> None:
         load_env_file()
+        key = os.environ.get("AGENT_LLM_API_KEY", "")
+        # endpoint heuristic: Google-issued keys (AQ.*) target the Gemini
+        # OpenAI-compatible endpoint unless overridden explicitly
         self.base_url = os.environ.get(
             "AGENT_LLM_BASE_URL",
             "https://generativelanguage.googleapis.com/v1beta/openai/"
-            if os.environ.get("AGENT_LLM_API_KEY", "").startswith("AQ.")
-            else "https://openrouter.ai/api/v1",
+            if key.startswith("AQ.") else "https://openrouter.ai/api/v1",
         )
-        self.api_key = os.environ.get("AGENT_LLM_API_KEY", "")
-        self.models = _models_from_env()
+        self.api_key = key
+        self.models = _models_from_env(self.base_url)
         self._client = OpenAI(base_url=self.base_url, api_key=self.api_key or "not-set")
 
     def chat(self, system: str, user: str, temperature: float = 0.2) -> str:
