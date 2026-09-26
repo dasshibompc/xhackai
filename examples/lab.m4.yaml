@@ -1,0 +1,41 @@
+# Example rulebook for a LOCAL, AUTHORIZED lab target with test accounts.
+# Never point allow_private at infrastructure you do not own.
+#
+# The auth: section is the M4 harness contract:
+#   - accounts are named here; credentials live ONLY in environment variables
+#     (e.g. LAB_ALICE_USERNAME / LAB_ALICE_PASSWORD), never in this file.
+#   - cookie mode: the harness POSTs username/password to login_url and
+#     captures the Set-Cookie session.
+#   - header mode: set session_mode: header and provide a token or static
+#     headers, e.g. headers: {Authorization: "Bearer {LAB_SVC_TOKEN}"}.
+name: local-lab-m4
+notes: >
+  Local vulnerable app for M4 access-control development. Two test accounts
+  (alice/bob) exercise the multi-account IDOR matrix. allow_private is required
+  for loopback targets and is only legitimate for targets you own.
+
+rate_limit:
+  requests_per_second: 5
+
+automation_policy: allowed   # allowed | restricted | prohibited
+
+scope:
+  - host: 127.0.0.1
+    allow_private: true
+  - host: localhost
+    allow_private: true
+
+out_of_scope:
+  - metadata.google.internal
+  - 169.254.169.254
+
+auth:
+  session_mode: cookie
+  login_success_status: 200
+  accounts:
+    - name: alice
+      env_prefix: LAB_ALICE
+      login_url: http://127.0.0.1:8770/login-session
+    - name: bob
+      env_prefix: LAB_BOB
+      login_url: http://127.0.0.1:8770/login-session

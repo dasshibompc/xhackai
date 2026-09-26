@@ -30,7 +30,8 @@ class HttpRequestTool(Tool):
     name = "http_request"
     description = (
         "Send a GET/POST/PUT/DELETE to an in-scope URL. Returns status, interesting "
-        "headers, and a body snippet. Out-of-scope or private-address requests are blocked."
+        "headers, and a body snippet. Out-of-scope or private-address requests are "
+        "blocked. Optional account=<name> authenticates as a configured test account."
     )
 
     def __init__(self, client: EnforcingClient) -> None:
@@ -39,11 +40,13 @@ class HttpRequestTool(Tool):
     last_output: str = ""
 
     def run(self, url: str, method: str = "GET", body: str | None = None,
-            headers: dict[str, str] | None = None) -> ToolResult:
+            headers: dict[str, str] | None = None,
+            account: str | None = None) -> ToolResult:
         try:
             resp = self.client.request(
                 method.upper(), url, headers=headers,
                 content=body if method.upper() not in ("GET", "HEAD", "DELETE", "OPTIONS") else None,
+                account=account,
             )
             summary = self.client.summarize(resp)
             self.last_output = summary

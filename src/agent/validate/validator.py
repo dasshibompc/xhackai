@@ -20,6 +20,7 @@ import os
 from ..db import Database
 from ..errors import AgentError
 from ..llm.provider import LLMProvider, extract_json
+from ..scope.auth import AuthError, AuthSpec
 from ..scope.client import EnforcingClient
 from ..scope.rulebook import Rulebook
 from .prompts import VALIDATOR_SYSTEM
@@ -36,14 +37,51 @@ _PROBE_MAP = {
     "SSRF (probe)": ("ssrf", ("url", "param")),
 }
 
+# M4: access-matrix findings are re-verified by re-running the full matrix
+_MATRIX_TYPES = {
+    "IDOR (cross-account matrix)",
+    "Access control (probable IDOR matrix)",
+}
 
-def _rerun_probe(finding_row, client: EnforcingClient) -> dict[str, Any]:
+
+def _rerun_matrix_probe(finding_row, client: EnforcingClient, db: Database,
+                        rulebook: Rulebook | None) -> dict[str, Any]:
+    """Stage-1 re-verification for access-matrix findings: re-run the matrix."""
+    from ..hunt.access import AccessMatrix  # lazy: hunt imports validate-safe modules only
+    evidence = json.loads(finding_row["evidence"]) if isinstance(finding_row["evidence"], str) else dict(finding_row["evidence"])
+    template = str(evidence.get("url_template") or finding_row["url"])
+    ids = evidence.get("ids")
+    id_param = str(evidence.get("id_param") or "id")
+    if not isinstance(ids, dict) or not ids:
+        return {"ok": False, "error": "matrix evidence missing account->id mapping"}
+    auth_spec = AuthSpec(getattr(rulebook, "auth", None) if rulebook else None)
+    if not auth_spec.accounts:
+        return {"ok": False, "error": "no auth: accounts configured in rulebook"}
+    try:
+        matrix = AccessMatrix(client, db, auth_spec)
+        result = matrix.run(template, ids={str(k): str(v) for k, v in ids.items()},
+                            id_param=id_param)
+    except AuthError as exc:
+        return {"ok": False, "error": f"auth: {exc}"}
+    except AgentError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"matrix error: {exc}"}
+    out = result.as_dict()
+    out["ok"] = True
+    return out
+
+
+def _rerun_probe(finding_row, client: EnforcingClient, db: Database | None = None,
+                 rulebook: Rulebook | None = None) -> dict[str, Any]:
     from ..hunt.payloads import fresh_marker  # noqa: F401 — marker logic lives in probes
     from ..hunt.probes import probe_reflection, probe_redirect, probe_sqli, probe_ssrf
 
     evidence = json.loads(finding_row["evidence"]) if isinstance(finding_row["evidence"], str) else dict(finding_row["evidence"])
     url = finding_row["url"]
     param = finding_row["parameter"] or ""
+    if finding_row["vuln_type"] in _MATRIX_TYPES:
+        return _rerun_matrix_probe(finding_row, client, db, rulebook)
     map_entry = _PROBE_MAP.get(finding_row["vuln_type"])
     if map_entry is None:
         return {"ok": False, "error": "no deterministic probe for this type"}
@@ -78,7 +116,7 @@ class Validator:
             fid = row["id"]
             # ---- stage 1: deterministic reproduction (types without a probe
             # become 'unverifiable' — they stay visible for human review)
-            repro = _rerun_probe(row, client)
+            repro = _rerun_probe(row, client, db, rulebook)
             if not repro.get("ok"):
                 db.conn.execute(
                     "UPDATE findings SET status='unverifiable', confidence=confidence*0.5 WHERE id=?",

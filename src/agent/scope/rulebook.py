@@ -30,6 +30,7 @@ class Rulebook:
     requests_per_second: float = 1.0
     automation_policy: str = "allowed"  # allowed | restricted | prohibited
     notes: str = ""
+    auth: dict = field(default_factory=dict)  # M4: raw auth: section (test accounts)
 
     # ----------------------------------------------------------------- parse
 
@@ -54,6 +55,7 @@ class Rulebook:
             requests_per_second=float(raw.get("rate_limit", {}).get("requests_per_second", 1.0)),
             automation_policy=str(raw.get("automation_policy", "allowed")).lower(),
             notes=str(raw.get("notes", "")),
+            auth=dict(raw.get("auth") or {}),
         )
 
     # ---------------------------------------------------------------- checks

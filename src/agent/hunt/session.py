@@ -10,9 +10,11 @@ from __future__ import annotations
 from ..db import Database
 from ..llm.provider import LLMProvider
 from ..loop import AgentLoop
+from ..scope.auth import AuthSpec, enable_auth
 from ..scope.client import EnforcingClient
 from ..scope.rulebook import Rulebook
 from ..tools import GrepTool, HttpRequestTool, SaveFindingTool
+from .access import AccessMatrixTool
 from .hypotheses import Hypothesis, propose_hypotheses
 from .probes import build_probe_tools
 
@@ -57,16 +59,26 @@ CLASS_PROMPTS = {
 }
 
 
+IDOR_MATRIX_PROMPT = (
+    " You also have the access_matrix tool: when test accounts are configured, "
+    "prefer it over probe_idor — pass url_template with an {id} placeholder and "
+    "ids mapping each account name to its own object id. It baselines every "
+    "account's own object first, then tests cross-account access."
+)
+
+
 class HunterSession:
     """Runs a specialized AgentLoop for one vulnerability class."""
 
     def __init__(self, provider: LLMProvider, client: EnforcingClient,
-                 db: Database, rulebook: Rulebook, max_steps: int = 12) -> None:
+                 db: Database, rulebook: Rulebook, max_steps: int = 12,
+                 auth_spec: AuthSpec | None = None) -> None:
         self.provider = provider
         self.client = client
         self.db = db
         self.rulebook = rulebook
         self.max_steps = max_steps
+        self.auth_spec = auth_spec
 
     def _tools(self) -> dict:
         http_tool = HttpRequestTool(self.client)
@@ -76,6 +88,8 @@ class HunterSession:
             SaveFindingTool(self.db).name: SaveFindingTool(self.db),
         }
         tools.update(build_probe_tools(self.client, self.db))
+        if self.auth_spec is not None and self.auth_spec.accounts:
+            tools["access_matrix"] = AccessMatrixTool(self.client, self.db, self.auth_spec)
         return tools
 
     def hunt(self, vuln_class: str, hypotheses: list[Hypothesis]) -> str:
@@ -96,9 +110,12 @@ class HunterSession:
         objective = "\n".join(objective_lines)
 
         loop = AgentLoop(self.provider, self._tools(), self.db, max_steps=self.max_steps)
+        class_prompt = CLASS_PROMPTS[vuln_class]
+        if vuln_class == "idor" and "access_matrix" in loop.tools:
+            class_prompt += IDOR_MATRIX_PROMPT
         # the specialized prompt must enumerate the real toolset, or free models
         # will invent tool names — build the system string from the registry
-        system = DISCOVERY_RULE + "\n\n" + CLASS_PROMPTS[vuln_class] + (
+        system = DISCOVERY_RULE + "\n\n" + class_prompt + (
             "\n\nAvailable tools:\n" + loop._tool_list()
             + '\n\nThe tool "finish" ends the session: '
               '{"tool": "finish", "args": {"summary": "..."}}'
@@ -114,12 +131,14 @@ class MultiClassHunter:
     """Hypothesize once, then run a hunter session per class with candidates."""
 
     def __init__(self, provider: LLMProvider, client: EnforcingClient,
-                 db: Database, rulebook: Rulebook, max_steps: int = 12) -> None:
+                 db: Database, rulebook: Rulebook, max_steps: int = 12,
+                 auth_spec: AuthSpec | None = None) -> None:
         self.provider = provider
         self.client = client
         self.db = db
         self.rulebook = rulebook
         self.max_steps = max_steps
+        self.auth_spec = auth_spec
 
     def run(self, classes: list[str] | None = None) -> dict:
         hypotheses = propose_hypotheses(self.provider, self.db, self.rulebook)
@@ -131,6 +150,7 @@ class MultiClassHunter:
             if classes and cls not in classes:
                 continue
             session = HunterSession(self.provider, self.client, self.db,
-                                    self.rulebook, self.max_steps)
+                                    self.rulebook, self.max_steps,
+                                    auth_spec=self.auth_spec)
             results[cls] = [session.hunt(cls, hyps)]
         return {"hypotheses": len(hypotheses), "sessions": results}
