@@ -1,0 +1,21 @@
+# Example rulebook for a LOCAL, AUTHORIZED lab target only.
+# Never point allow_private at infrastructure you do not own.
+name: local-lab
+notes: >
+  Local vulnerable app for development. allow_private is required for loopback
+  targets and is only legitimate for targets you own.
+
+rate_limit:
+  requests_per_second: 5
+
+automation_policy: allowed   # allowed | restricted | prohibited
+
+scope:
+  - host: 127.0.0.1
+    allow_private: true
+  - host: localhost
+    allow_private: true
+
+out_of_scope:
+  - metadata.google.internal
+  - 169.254.169.254
