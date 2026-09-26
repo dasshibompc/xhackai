@@ -13,6 +13,7 @@ from .hunt.access import AccessMatrix
 from .hunt.session import MultiClassHunter
 from .llm.provider import LLMProvider
 from .loop import AgentLoop
+from .recon.params import discover_hidden_params, mine_params
 from .recon.pipeline import ReconPipeline
 from .recon.runner import ToolRunner, gather_environment
 from .recon.tools_recon import build_recon_tools
@@ -53,6 +54,21 @@ def _warn_accounts(spec: AuthSpec | None) -> None:
                           f"{', '.join(missing)} — requests will fail[/yellow]")
         else:
             console.print(f"[green]account '{name}': ready[/green]")
+
+
+def _make_oob(enabled: bool):
+    """Start an interactsh manager when available; degrade gracefully."""
+    if not enabled:
+        return None
+    from .oob.interactsh import InteractshManager, InteractshError
+    try:
+        mgr = InteractshManager.start()
+        console.print(f"[green]OOB channel up:[/green] {len(mgr.payloads)} callback payloads reserved")
+        return mgr
+    except InteractshError as exc:
+        console.print(f"[yellow]OOB channel unavailable ({exc}) — blind vulns "
+                      f"will stay unconfirmed[/yellow]")
+        return None
 
 
 @app.command()
@@ -138,9 +154,12 @@ def hunt_vulns(
         _warn_accounts(auth_spec)
     provider = LLMProvider()
     class_list = [c.strip().lower() for c in classes.split(",") if c.strip()] or None
+    oob = _make_oob(enabled=True)
     hunter = MultiClassHunter(provider, client, db, rulebook, max_steps=max_steps,
-                              auth_spec=auth_spec)
+                              auth_spec=auth_spec, oob=oob)
     result = hunter.run(classes=class_list)
+    if oob is not None:
+        oob.stop()
     console.print(f"[bold]hypotheses:[/bold] {result['hypotheses']}")
     for cls, summaries in result["sessions"].items():
         console.print(f"[bold green]{cls}[/bold green]: {summaries[-1]}")
@@ -157,7 +176,12 @@ def validate(
     db = Database(db_path)
     client = EnforcingClient(rulebook, db)
     provider = LLMProvider()
-    stats = Validator().validate_all(db, provider, client, rulebook)
+    oob = _make_oob(enabled=True)
+    try:
+        stats = Validator().validate_all(db, provider, client, rulebook, oob=oob)
+    finally:
+        if oob is not None:
+            oob.stop()
     console.print(f"[bold]validation:[/bold] {stats}")
     console.print("Validated findings await [bold]human review[/bold] — the agent cannot submit.")
 
@@ -294,6 +318,38 @@ def access_matrix(
         console.print("no finding recorded (precision-first)")
 
 
+@app.command("params")
+def params_cmd(
+    program: Path = typer.Argument(..., exists=True),
+    url: str = typer.Option("", help="Also run hidden-param discovery on this URL"),
+    max_requests: int = typer.Option(120, help="Request budget for discovery"),
+    db_path: str = typer.Option("agent.db"),
+) -> None:
+    """Mine real parameters from pages/forms and (optionally) brute-force hidden ones."""
+    rulebook = _load_program(program)
+    db = Database(db_path)
+    client = EnforcingClient(rulebook, db)
+    stats = mine_params(client, db, rulebook)
+    console.print(f"[bold]mining:[/bold] {stats}")
+    if url:
+        allowed, _ = rulebook.check(url)
+        if not allowed:
+            console.print("[red]url is out of scope — discovery skipped[/red]")
+            raise typer.Exit(1)
+        disc = discover_hidden_params(client, db, url, max_requests=max_requests)
+        if disc.get("ok"):
+            console.print(f"[bold]discovery:[/bold] spent {disc['requests_spent']} requests, "
+                          f"found {[f['name'] for f in disc['found']]}")
+        else:
+            console.print(f"[red]discovery failed: {disc.get('error')}[/red]")
+    table = Table(show_header=True)
+    for col in ("host", "param", "kind", "source"):
+        table.add_column(col)
+    for r in db.list_params():
+        table.add_row(r["host"], r["name"], r["kind"], r["source"])
+    console.print(table)
+
+
 @app.command()
 def bench(
     program: Path = typer.Argument(..., exists=True),
@@ -314,6 +370,246 @@ def bench(
     print_results(results, console)
     path = save_benchmarks(results)
     console.print(f"[green]results appended to[/green] {path}")
+
+
+@app.command("run-chain")
+def run_chain(
+    program: Path = typer.Argument(..., exists=True),
+    template: str = typer.Option("cross-account-create-read"),
+    base_url: str = typer.Option(..., help="e.g. http://host"),
+    create_path: str = typer.Option(..., help="POST endpoint returning JSON with id"),
+    read_path_template: str = typer.Option(..., help="e.g. /api/note/{id}?debug=vuln"),
+    body: str = typer.Option("", help='JSON create body, e.g. \'{"title": "note"}\''),
+    owner_field: str = typer.Option("owner"),
+    id_field: str = typer.Option("id"),
+    accounts: str = typer.Option("", help='JSON list of 2 account names'),
+    db_path: str = typer.Option("agent.db"),
+) -> None:
+    """Run a prebuilt exploit chain (deterministic; no LLM)."""
+    rulebook = _load_program(program)
+    db = Database(db_path)
+    client = EnforcingClient(rulebook, db)
+    spec_auth = _auth_spec_for(rulebook)
+    if spec_auth is None or not spec_auth.accounts:
+        console.print("[red]rulebook has no auth: accounts — chains need sessions[/red]")
+        raise typer.Exit(1)
+    enable_auth(client, spec_auth)
+    if accounts:
+        try:
+            accounts = json.loads(accounts)
+        except json.JSONDecodeError as exc:
+            console.print(f"[red]accounts is not valid JSON: {exc}[/red]")
+            raise typer.Exit(1)
+    from .hunt.chains import ChainTool
+    tool = ChainTool(client, db)
+    res = tool.run(template=template, base_url=base_url, create_path=create_path,
+                   read_path_template=read_path_template,
+                   body=(json.loads(body) if body else None),
+                   owner_field=owner_field, id_field=id_field,
+                   accounts=accounts)
+    console.print(res.output)
+    if not res.ok:
+        raise typer.Exit(1)
+
+
+@app.command("callback")
+def callback_cmd(
+    url: str = typer.Option(..., help="Target URL, e.g. http://127.0.0.1:8770"),
+    objectives: str = typer.Option("", help="What you want found, e.g. 'xss and access control'"),
+    notes: str = typer.Option("", help="Context for the report/digest, e.g. 'my local lab'"),
+    port: int = typer.Option(0, help="Optional port override for the URL"),
+    rate_limit: float = typer.Option(1.0, help="Requests per second (default 1.0)"),
+) -> None:
+    """One command, whole pipeline: probe -> mine -> hunt -> validate -> report.
+
+    Generates a scope rulebook from --url automatically (loopback/private
+    targets get allow_private with a loud warning — only point this at things
+    you are authorized to test). Findings are DRAFTS; you approve everything.
+    """
+    import tempfile
+
+    from urllib.parse import urlsplit, urlunsplit
+
+    from .db import Database as _DB
+    from .recon.inventory import Inventory
+    from .recon.params import mine_params
+    from .scope.client import host_resolves_private
+
+    # ---- normalize the URL with the optional port
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        console.print("[red]--url must be an absolute http(s) URL[/red]")
+        raise typer.Exit(1)
+    host = parts.hostname
+    netloc = host
+    if port:
+        netloc = f"{host}:{port}"
+    elif parts.port:
+        netloc = f"{host}:{parts.port}"
+    target = urlunsplit((parts.scheme, netloc, parts.path or "/", "", ""))
+
+    # ---- generate the rulebook from the URL
+    private = host_resolves_private(host)
+    scope_entries = [{"host": host, "allow_private": True}]
+    if host in ("127.0.0.1", "localhost"):
+        other = "localhost" if host == "127.0.0.1" else "127.0.0.1"
+        scope_entries.append({"host": other, "allow_private": True})
+    rb_data = {
+        "name": f"callback-{host}",
+        "notes": notes or f"operator target {target}",
+        "rate_limit": {"requests_per_second": max(0.1, float(rate_limit))},
+        "automation_policy": "allowed",
+        "scope": scope_entries,
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        import yaml as _yaml
+        _yaml.safe_dump(rb_data, fh)
+        rb_path = Path(fh.name)
+    rulebook = Rulebook.load(rb_path)
+    console.print(f"[bold]Program:[/bold] {rulebook.name}  "
+                  f"[bold]rate:[/bold] {rate_limit} rps")
+    if private:
+        console.print("[yellow]WARNING: target resolves to a private/loopback "
+                      "address — only proceed if you own/are authorized for it.[/yellow]")
+
+    db = _DB("agent.db")
+    client = EnforcingClient(rulebook, db)
+
+    # ---- seed the inventory with the operator's URL (one live fetch)
+    inv = Inventory(db, rulebook)
+    try:
+        inv.add_host(host, "operator")
+    except Exception as exc:  # noqa: BLE001 — OOS is impossible here (we wrote the rulebook)
+        console.print(f"[red]seed failed: {exc}[/red]")
+        raise typer.Exit(1)
+    status, title = 0, ""
+    try:
+        resp = client.get(target)
+        status, title = resp.status_code, resp.text.split("<title>", 1)[-1].split("</title>", 1)[0][:120]
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]target fetch failed ({exc}) — continuing[/yellow]")
+    inv.probe_result(host, target, status, title, [])
+    console.print(f"[bold]target:[/bold] {target}  [bold]status:[/bold] {status or '?'}")
+
+    # ---- cheap coverage: mine real params from the reachable pages
+    mining = mine_params(client, db, rulebook, max_pages=10)
+    console.print(f"[bold]mining:[/bold] {mining}")
+
+    # ---- hunt (LLM) with OOB when available
+    provider = LLMProvider()
+    oob = _make_oob(enabled=True)
+    try:
+        hunter = MultiClassHunter(provider, client, db, rulebook, max_steps=12,
+                                  oob=oob, operator_objectives=objectives)
+        hunt_result = hunter.run()
+        console.print(f"[bold]hypotheses:[/bold] {hunt_result['hypotheses']}  "
+                      f"[bold]dropped (known-rejected):[/bold] "
+                      f"{hunt_result.get('dropped_as_rejected', 0)}")
+        for cls, summaries in hunt_result["sessions"].items():
+            console.print(f"[bold green]{cls}[/bold green]: {summaries[-1]}")
+
+        # ---- validate
+        stats = Validator().validate_all(db, provider, client, rulebook, oob=oob)
+        console.print(f"[bold]validation:[/bold] {stats}")
+    finally:
+        if oob is not None:
+            oob.stop()
+
+    # ---- report
+    written = write_reports(db, "reports")
+    for p in written:
+        console.print(f"[green]wrote[/green] {p}")
+
+    # ---- final summary: everything awaits YOUR approval
+    table = Table(show_header=True)
+    for col in ("id", "type", "url", "confidence", "status"):
+        table.add_column(col)
+    for f in db.list_findings():
+        table.add_row(str(f["id"]), f["vuln_type"], f["url"],
+                      str(f["confidence"]), f["status"])
+    console.print(table)
+    tamper = len(db.list_tamper_events())
+    if tamper:
+        console.print(f"[yellow]{tamper} tamper event(s) logged — scanned pages "
+                      f"tried to prompt-inject the agent (see tamper_events)[/yellow]")
+    console.print("[bold]All findings are drafts. A human reviews and submits — "
+                  "the agent cannot.[/bold]")
+
+
+@app.command("ps-bench")
+def ps_bench_cmd(
+    url: str = typer.Option(..., help="Lab instance URL from your browser"),
+    lab_class: str = typer.Option(..., help="xss | sqli | redirect | ssrf | idor | access"),
+    objectives: str = typer.Option("", help="Optional operator objectives"),
+    db_path: str = typer.Option("", help="Per-run DB path (default: timestamped)"),
+    max_steps: int = typer.Option(10, help="Max steps per hunter session"),
+) -> None:
+    """Run the FULL pipeline autonomously against one PortSwigger lab instance.
+
+    Human input is exactly: launch lab in browser -> paste URL here -> later
+    confirm solved/unsolved with ps-bench-score. Everything else is the agent.
+    """
+    from .psbench import run_lab_pipeline
+    run = run_lab_pipeline(url=url, lab_class=lab_class.lower().strip(),
+                           objectives=objectives, db_path=db_path or None,
+                           console=console, max_steps=max_steps)
+    n = sum(1 for _ in (Path("benchmarks") / "psbench-runs.jsonl").open()) if \
+        (Path("benchmarks") / "psbench-runs.jsonl").exists() else 0
+    console.print(f"[bold]run #{n} recorded[/bold] — score it with: "
+                  f"[bold]bounty-agent ps-bench-score {n} --solved/--unsolved "
+                  f"--agrees/--disagrees[/bold]")
+
+
+@app.command("ps-bench-score")
+def ps_bench_score_cmd(
+    seq: int = typer.Argument(..., help="Run number (from ps-bench output)"),
+    solved: bool = typer.Option(False, "--solved", help="Lab banner says solved"),
+    unsolved: bool = typer.Option(False, "--unsolved", help="Lab not solved"),
+    agrees: bool = typer.Option(False, "--agrees", help="You agree with the validated finding(s)"),
+    disagrees: bool = typer.Option(False, "--disagrees", help="Validated finding(s) wrong/FP"),
+) -> None:
+    """Attach YOUR scoring to a recorded run (the only human input in the gate)."""
+    from .psbench import gate_status, score_run
+    if solved == unsolved:
+        console.print("[red]pass exactly one of --solved / --unsolved[/red]")
+        raise typer.Exit(1)
+    row = score_run(seq=seq, solved=solved,
+                    agrees=(True if agrees else False if disagrees else None))
+    console.print(f"[green]scored run #{seq}[/green]: "
+                  f"solved={row['human_solved']} agrees={row['human_agrees']}")
+    status = gate_status()
+    console.print(f"[bold]gate:[/bold] {status['scored']}/{status['gate_min_runs']} "
+                  f"scored runs, solve {status['solve_rate']:.0%}, "
+                  f"precision {status['precision']:.0%} "
+                  f"-> {'[green]PASS[/green]' if status['gate'] else status['reason']}")
+
+
+@app.command("ps-gate")
+def ps_gate_cmd() -> None:
+    """Show PortSwigger gate readiness (solve rate + precision vs. targets)."""
+    from .psbench import gate_status
+    s = gate_status()
+    for k, v in s.items():
+        console.print(f"[bold]{k}:[/bold] {v}")
+
+
+@app.command("lessons")
+def lessons_cmd(
+    db_path: str = typer.Option("agent.db"),
+    host: str = typer.Option("", help="Filter by host"),
+) -> None:
+    """Show accumulated hunt memory (known rejections / trap regressions)."""
+    db = Database(db_path)
+    rows = db.list_lessons(host=host or None)
+    if not rows:
+        console.print("[yellow]no lessons recorded yet[/yellow]")
+        raise typer.Exit(0)
+    table = Table(show_header=True)
+    for col in ("weight", "signature", "lesson", "source"):
+        table.add_column(col)
+    for r in rows:
+        table.add_row(str(r["weight"]), r["signature"], r["lesson"][:60], r["source"])
+    console.print(table)
 
 
 def main() -> None:

@@ -38,7 +38,8 @@ HTTPX = ToolSpec("httpx", "projectdiscovery/httpx", "httpx")
 NUCLEI = ToolSpec("nuclei", "projectdiscovery/nuclei", "nuclei")
 KATANA = ToolSpec("katana", "projectdiscovery/katana", "katana")
 XNLINKFINDER = ToolSpec("xnLinkFinder", "", "xnLinkFinder")
-ALL_SPECS = (SUBFASTER, HTTPX, NUCLEI, KATANA, XNLINKFINDER)
+INTERACTSH = ToolSpec("interactsh", "projectdiscovery/interactsh", "interactsh-client")
+ALL_SPECS = (SUBFASTER, HTTPX, NUCLEI, KATANA, XNLINKFINDER, INTERACTSH)
 
 
 def parse_json_lines(text: str) -> list[dict]:
@@ -188,6 +189,8 @@ def gather_environment(
                          if spec.name == "katana" else
                          f"pip install xnLinkFinder"
                          if spec.name == "xnLinkFinder" else
+                         f"go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest"
+                         if spec.name == "interactsh" else
                          f"docker pull {spec.image} (or drop binary in bin/)") if not mode else "",
             }
         )

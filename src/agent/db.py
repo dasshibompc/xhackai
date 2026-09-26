@@ -77,9 +77,54 @@ CREATE TABLE IF NOT EXISTS endpoints (
     source TEXT NOT NULL,
     UNIQUE(url, kind)
 );
+
+CREATE TABLE IF NOT EXISTS tamper_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    url TEXT NOT NULL,
+    host TEXT NOT NULL,
+    categories TEXT NOT NULL,
+    redactions INTEGER NOT NULL DEFAULT 0,
+    marker_echo INTEGER NOT NULL DEFAULT 0,
+    samples TEXT
+);
+
+CREATE TABLE IF NOT EXISTS params (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    host TEXT NOT NULL,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL,
+    example_url TEXT,
+    UNIQUE(host, name, kind)
+);
+
+CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    host TEXT NOT NULL,
+    signature TEXT NOT NULL UNIQUE,
+    lesson TEXT NOT NULL,
+    source TEXT NOT NULL,
+    weight INTEGER NOT NULL DEFAULT 1
+);
 """
 
 _GENESIS = "0" * 64
+
+
+def parse_evidence(value) -> dict:
+    """Evidence columns may hold JSON (tool-recorded findings) or free text
+    (LLM save_finding). Parse defensively — prose becomes {"raw": ...} so one
+    verbose model can never crash validation or reporting."""
+    if isinstance(value, dict):
+        return value
+    try:
+        data = json.loads(value) if value else {}
+        return data if isinstance(data, dict) else {"raw": data}
+    except (json.JSONDecodeError, TypeError):
+        return {"raw": str(value)[:2000]}
 
 
 def _host_of(url: str) -> str:
@@ -148,6 +193,10 @@ class Database:
 
     # -------------------------------------------------------------- findings
 
+    def evidence_of(self, row) -> dict:
+        """Defensively parsed evidence for a finding row (see parse_evidence)."""
+        return parse_evidence(row["evidence"])
+
     def add_finding(
         self,
         vuln_type: str,
@@ -177,6 +226,108 @@ class Database:
         return list(
             self.conn.execute("SELECT * FROM findings ORDER BY id DESC").fetchall()
         )
+
+    # --------------------------------------------------------- tamper events
+
+    def log_tamper_event(self, url: str, categories: list[str],
+                         redactions: int = 0, marker_echo: bool = False,
+                         samples: list[str] | None = None) -> int:
+        """Record a prompt-injection attempt seen in scanned content (M5a).
+        Samples are pre-neutralized by the guard; stored for human review."""
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        cur = self.conn.execute(
+            "INSERT INTO tamper_events (ts, url, host, categories, redactions,"
+            " marker_echo, samples) VALUES (?,?,?,?,?,?,?)",
+            (time.time(), url, host, ",".join(sorted(set(categories))),
+             redactions, int(marker_echo),
+             json.dumps(samples[:5]) if samples else None),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def list_tamper_events(self, host: str | None = None) -> list[sqlite3.Row]:
+        q = "SELECT * FROM tamper_events"
+        args: list = []
+        if host:
+            q += " WHERE host=?"
+            args.append(host)
+        q += " ORDER BY id DESC"
+        return list(self.conn.execute(q, args).fetchall())
+
+    # -------------------------------------------------------------- feedback
+
+    def add_lesson(self, signature: str, lesson: str, source: str,
+                   host: str = "") -> int:
+        """Record (or reinforce) a lesson (M5e). Repeated signatures bump the
+        weight instead of duplicating rows — weight = how often the pattern
+        has already cost us time."""
+        signature = (signature or "").strip()[:300]
+        if not signature:
+            return 0
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT id, weight FROM feedback WHERE signature=?", (signature,)
+            ).fetchone()
+            if row:
+                self.conn.execute(
+                    "UPDATE feedback SET weight=weight+1, ts=? WHERE id=?",
+                    (time.time(), row["id"]),
+                )
+                self.conn.commit()
+                return int(row["id"])
+            cur = self.conn.execute(
+                "INSERT INTO feedback (ts, host, signature, lesson, source, weight)"
+                " VALUES (?,?,?,?,?,1)",
+                (time.time(), host, signature, lesson[:600], source),
+            )
+            self.conn.commit()
+            return int(cur.lastrowid)
+
+    def list_lessons(self, host: str | None = None,
+                     min_weight: int = 1) -> list[sqlite3.Row]:
+        q = "SELECT * FROM feedback WHERE weight>=?"
+        args: list = [min_weight]
+        if host:
+            q += " AND host=?"
+            args.append(host)
+        q += " ORDER BY weight DESC, ts DESC"
+        return list(self.conn.execute(q, args).fetchall())
+
+    # ---------------------------------------------------------- parameters
+
+    def add_param(self, name: str, host: str, kind: str, source: str,
+                  example_url: str | None = None) -> int | None:
+        """Record a real parameter name (M5c). kind: query|form|mined|
+        reflected|differential. Returns row id or None on duplicate."""
+        name = (name or "").strip()
+        if not name or len(name) > 64:
+            return None
+        try:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO params (ts, host, name, kind, source,"
+                " example_url) VALUES (?,?,?,?,?,?)",
+                (time.time(), host.lower(), name, kind, source, example_url),
+            )
+            self.conn.commit()
+            return int(cur.lastrowid) if cur.rowcount else None
+        except sqlite3.IntegrityError:
+            return None
+
+    def list_params(self, kind: str | None = None,
+                    host: str | None = None) -> list[sqlite3.Row]:
+        q = "SELECT * FROM params"
+        cond, args = [], []
+        if kind:
+            cond.append("kind=?")
+            args.append(kind)
+        if host:
+            cond.append("host=?")
+            args.append(host)
+        if cond:
+            q += " WHERE " + " AND ".join(cond)
+        q += " ORDER BY host, name"
+        return list(self.conn.execute(q, args).fetchall())
 
     # ------------------------------------------------------------ endpoints
 

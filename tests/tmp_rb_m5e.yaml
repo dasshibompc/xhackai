@@ -1,0 +1,12 @@
+auth:
+  accounts:
+  - env_prefix: LAB_ALICE
+    login_url: http://127.0.0.1:8775/login-session
+    name: alice
+automation_policy: allowed
+name: lab
+rate_limit:
+  requests_per_second: 50
+scope:
+- allow_private: true
+  host: 127.0.0.1

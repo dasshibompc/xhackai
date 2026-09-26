@@ -10,7 +10,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .db import Database
+from .db import Database, parse_evidence
 
 # rough CVSS v3.1 base-score anchors per class (human refines on review)
 SEVERITY_BY_CLASS = {
@@ -19,6 +19,7 @@ SEVERITY_BY_CLASS = {
     "Reflected XSS": ("Medium", 6.1, "AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"),
     "Open Redirect": ("Low", 4.3, "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N"),
     "IDOR": ("High", 8.1, "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N"),
+    "Access Control": ("High", 8.1, "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N"),
 }
 
 
@@ -30,7 +31,7 @@ def _classify(vuln_type: str) -> tuple[str, float, str] | None:
 
 
 def generate_report(finding_row, db: Database) -> str:
-    evidence = json.loads(finding_row["evidence"]) if isinstance(finding_row["evidence"], str) else dict(finding_row["evidence"])
+    evidence = parse_evidence(finding_row["evidence"])
     sev = _classify(finding_row["vuln_type"]) or ("Medium", 5.0, "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N")
     reval = evidence.get("revalidation") or {}
     lines = [

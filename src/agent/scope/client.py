@@ -48,6 +48,9 @@ class EnforcingClient:
         # Auth harness (M4): a SessionManager attached by scope.auth.enable_auth().
         # None = unauthenticated testing only.
         self.auth: Any | None = None
+        # M5a: live probe markers, registered by probes so summarize() can
+        # detect marker-echo manipulation in scanned pages.
+        self.active_markers: list[str] = []
         self._lock = threading.Lock()
         self._last_request_ts = 0.0
         self._min_interval = 1.0 / max(rulebook.requests_per_second, 0.01)
@@ -123,6 +126,12 @@ class EnforcingClient:
                           reason=(f"account={account}" if account else None))
         return resp
 
+    def note_marker(self, marker: str) -> None:
+        """Register a live probe marker (bounded to the 20 most recent)."""
+        if marker and marker not in self.active_markers:
+            self.active_markers.append(marker)
+            del self.active_markers[:-20]
+
     # ------------------------------------------------------- agent convenience
 
     def get(self, url: str, **kwargs) -> httpx.Response:
@@ -135,19 +144,42 @@ class EnforcingClient:
             kwargs["data"] = data
         return self.request("POST", url, **kwargs)
 
-    def summarize(self, resp: httpx.Response, body_limit: int = 1500) -> str:
-        """Compact, token-cheap summary for the LLM context."""
+    def summarize(self, resp: httpx.Response, body_limit: int = 1500,
+                  active_markers: list[str] | None = None) -> str:
+        """Compact, token-cheap summary for the LLM context.
+
+        M5a: the body is untrusted data. It is sanitized (instruction-shaped
+        content redacted), wrapped in an explicit data fence, and detected
+        manipulation is logged as a tamper event before the model sees it.
+        """
+        from .guard import sanitize_body, wrap_untrusted
+        if active_markers is None:
+            active_markers = self.active_markers
         headers = {k: v for k, v in resp.headers.items() if k.lower() in {
             "content-type", "server", "location", "set-cookie", "content-length",
             "x-frame-options", "access-control-allow-origin", "strict-transport-security",
         }}
-        body = resp.text[:body_limit]
-        return json.dumps(
-            {
-                "status": resp.status_code,
-                "url": str(resp.request.url),
-                "headers": headers,
-                "body_snippet": body + ("…[truncated]" if len(resp.text) > body_limit else ""),
-            },
-            indent=1,
-        )
+        raw = resp.text
+        body = raw[:body_limit]
+        report = sanitize_body(body, active_markers=active_markers)
+        if report.suspicious:
+            try:
+                self.db.log_tamper_event(
+                    str(resp.request.url), report.categories,
+                    redactions=report.redactions, marker_echo=report.marker_echo,
+                    samples=report.samples,
+                )
+            except Exception:  # noqa: BLE001 — tamper logging must never break requests
+                pass
+        payload = {
+            "status": resp.status_code,
+            "url": str(resp.request.url),
+            "headers": headers,
+            "body_snippet": wrap_untrusted(report.sanitized)
+            + ("…[truncated]" if len(raw) > body_limit else ""),
+        }
+        # M5a: the model sees only counts/categories (no samples — those are
+        # human evidence in the tamper log); redacted text is already replaced.
+        if report.suspicious:
+            payload["guard"] = report.as_dict()
+        return json.dumps(payload, indent=1)

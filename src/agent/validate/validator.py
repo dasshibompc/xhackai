@@ -20,10 +20,12 @@ import os
 from ..db import Database
 from ..errors import AgentError
 from ..llm.provider import LLMProvider, extract_json
+from ..oob.interactsh import FakeInteractshManager, InteractshManager
 from ..scope.auth import AuthError, AuthSpec
 from ..scope.client import EnforcingClient
 from ..scope.rulebook import Rulebook
 from .prompts import VALIDATOR_SYSTEM
+from ..hunt.lessons import tag_rejection  # M5e: rejections become hunt memory
 
 # Precision-first default: a finding needs strong adversarial agreement to be
 # surfaced for submission. Lower it (e.g. 0.6) to trade FP risk for recall.
@@ -43,12 +45,44 @@ _MATRIX_TYPES = {
     "Access control (probable IDOR matrix)",
 }
 
+# M5d: chain findings are re-verified by re-executing the whole chain spec
+_CHAIN_TYPES = {"Access control (chained)"}
+
+
+def _rerun_chain_probe(finding_row, client: EnforcingClient, db: Database,
+                       rulebook: Rulebook | None) -> dict[str, Any]:
+    """Stage-1 re-verification for chain findings: re-execute the stored spec.
+    Note: create steps run again (one extra object per validation) — recorded
+    in the evidence bundle for the human."""
+    from ..hunt.chains import ChainRunner
+    evidence = db.evidence_of(finding_row) if db is not None else (
+        json.loads(finding_row["evidence"]) if isinstance(finding_row["evidence"], str) else dict(finding_row["evidence"]))
+    spec = evidence.get("chain")
+    if not isinstance(spec, dict) or not spec.get("steps"):
+        return {"ok": False, "error": "chain evidence missing runnable spec"}
+    if getattr(client, "auth", None) is None:
+        auth_spec = AuthSpec(getattr(rulebook, "auth", None) if rulebook else None)
+        if not auth_spec.accounts:
+            return {"ok": False, "error": "no auth accounts configured for chain re-run"}
+        from ..scope.auth import enable_auth
+        enable_auth(client, auth_spec)
+    try:
+        result = ChainRunner(client, db).run(spec)
+    except AgentError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"chain error: {exc}"}
+    out = result.as_dict()
+    out["ok"] = True
+    return out
+
 
 def _rerun_matrix_probe(finding_row, client: EnforcingClient, db: Database,
                         rulebook: Rulebook | None) -> dict[str, Any]:
     """Stage-1 re-verification for access-matrix findings: re-run the matrix."""
     from ..hunt.access import AccessMatrix  # lazy: hunt imports validate-safe modules only
-    evidence = json.loads(finding_row["evidence"]) if isinstance(finding_row["evidence"], str) else dict(finding_row["evidence"])
+    evidence = db.evidence_of(finding_row) if db is not None else (
+        json.loads(finding_row["evidence"]) if isinstance(finding_row["evidence"], str) else dict(finding_row["evidence"]))
     template = str(evidence.get("url_template") or finding_row["url"])
     ids = evidence.get("ids")
     id_param = str(evidence.get("id_param") or "id")
@@ -73,15 +107,21 @@ def _rerun_matrix_probe(finding_row, client: EnforcingClient, db: Database,
 
 
 def _rerun_probe(finding_row, client: EnforcingClient, db: Database | None = None,
-                 rulebook: Rulebook | None = None) -> dict[str, Any]:
+                 rulebook: Rulebook | None = None,
+                 oob: "InteractshManager | FakeInteractshManager | None" = None) -> dict[str, Any]:
     from ..hunt.payloads import fresh_marker  # noqa: F401 — marker logic lives in probes
     from ..hunt.probes import probe_reflection, probe_redirect, probe_sqli, probe_ssrf
 
-    evidence = json.loads(finding_row["evidence"]) if isinstance(finding_row["evidence"], str) else dict(finding_row["evidence"])
+    evidence = db.evidence_of(finding_row) if db is not None else (
+        json.loads(finding_row["evidence"]) if isinstance(finding_row["evidence"], str) else dict(finding_row["evidence"]))
     url = finding_row["url"]
     param = finding_row["parameter"] or ""
     if finding_row["vuln_type"] in _MATRIX_TYPES:
         return _rerun_matrix_probe(finding_row, client, db, rulebook)
+    if finding_row["vuln_type"] in _CHAIN_TYPES:
+        if db is None:
+            return {"ok": False, "error": "chain re-run needs the database"}
+        return _rerun_chain_probe(finding_row, client, db, rulebook)
     map_entry = _PROBE_MAP.get(finding_row["vuln_type"])
     if map_entry is None:
         return {"ok": False, "error": "no deterministic probe for this type"}
@@ -92,11 +132,17 @@ def _rerun_probe(finding_row, client: EnforcingClient, db: Database | None = Non
         if cls == "xss":
             return probe_reflection(client, url, param)
         if cls == "sqli":
+            # with an OOB manager, blind SQLi gets a callback-based second look
+            if oob is not None:
+                from ..hunt.probes import probe_sqli_oob
+                oob_ev = probe_sqli_oob(client, url, param, oob, method=method)
+                if oob_ev.get("vulnerable"):
+                    return oob_ev
             return probe_sqli(client, url, param, method=method)
         if cls == "redirect":
             return probe_redirect(client, url, param)
         if cls == "ssrf":
-            return probe_ssrf(client, url, param, port=port)
+            return probe_ssrf(client, url, param, port=port, oob=oob)
     except AgentError as exc:
         return {"ok": False, "error": f"scope/agent error: {exc}"}
     except Exception as exc:  # noqa: BLE001
@@ -109,14 +155,15 @@ class Validator:
         return [r for r in db.list_findings() if r["status"] == "candidate"]
 
     def validate_all(self, db: Database, provider: LLMProvider,
-                     client: EnforcingClient, rulebook: Rulebook) -> dict:
+                     client: EnforcingClient, rulebook: Rulebook,
+                     oob: "InteractshManager | FakeInteractshManager | None" = None) -> dict:
         stats = {"verified": 0, "replicated": 0, "failed_repro": 0,
                  "debated": 0, "upgraded": 0, "downgraded": 0, "rejected": 0}
         for row in self._list_candidates(db):
             fid = row["id"]
             # ---- stage 1: deterministic reproduction (types without a probe
             # become 'unverifiable' — they stay visible for human review)
-            repro = _rerun_probe(row, client, db, rulebook)
+            repro = _rerun_probe(row, client, db, rulebook, oob=oob)
             if not repro.get("ok"):
                 db.conn.execute(
                     "UPDATE findings SET status='unverifiable', confidence=confidence*0.5 WHERE id=?",
@@ -126,7 +173,34 @@ class Validator:
                 stats["failed_repro"] += 1
                 continue
             stats["replicated"] += 1
-            evidence = json.loads(row["evidence"]) if isinstance(row["evidence"], str) else dict(row["evidence"])
+            evidence = db.evidence_of(row)
+            # M4/M5d: matrix/chain re-runs classify the target. A clean
+            # contradiction with the original verdict is decided HERE,
+            # deterministically — the debate must not rescue a finding whose
+            # reproduction now says the opposite.
+            if "classification" in repro and not repro.get("vulnerable"):
+                cls = str(repro.get("classification", "inconclusive"))
+                merged = {**evidence, "revalidation": repro,
+                          "rejection_reason": f"deterministic re-run classified '{cls}'"}
+                if cls in ("denied", "secure"):
+                    db.conn.execute(
+                        "UPDATE findings SET status='rejected', evidence=? WHERE id=?",
+                        (json.dumps(merged), fid),
+                    )
+                    db.conn.commit()
+                    tag_rejection(db, row, f"deterministic re-run classified '{cls}'",
+                                  source="validator-repro")
+                    stats["rejected"] += 1
+                    continue
+                if cls == "inconclusive":
+                    db.conn.execute(
+                        "UPDATE findings SET status='unverifiable',"
+                        " confidence=confidence*0.5, evidence=? WHERE id=?",
+                        (json.dumps(merged), fid),
+                    )
+                    db.conn.commit()
+                    stats["failed_repro"] += 1
+                    continue
             evidence["revalidation"] = repro
             # ---- stage 2: adversarial debate (any failure degrades to
             # needs-review, never crashes the run)
@@ -135,6 +209,10 @@ class Validator:
                 "vuln_type": row["vuln_type"], "url": row["url"],
                 "param": row["parameter"], "evidence": evidence,
             }, indent=1)[:6000]
+            # M5a: evidence strings can embed attacker-controlled page content;
+            # sanitize + fence so poisoned evidence cannot argue its own case.
+            from ..scope.guard import sanitize_for_prompt
+            debate_payload = sanitize_for_prompt(debate_payload)
             try:
                 reply = provider.chat(VALIDATOR_SYSTEM, debate_payload)
                 try:
@@ -164,6 +242,8 @@ class Validator:
                 stats["upgraded"] += 1
             elif is_vuln == "no" and confidence >= 0.7:
                 new_status, new_conf = "rejected", confidence
+                tag_rejection(db, row, str(verdict.get("reasoning", "debate rejected"))[:300],
+                              source="validator-debate")
                 stats["rejected"] += 1
             else:
                 new_status, new_conf = "needs-review", min(max(confidence, 0.3),

@@ -66,12 +66,25 @@ def run_case(case: BenchCase, client: EnforcingClient, db: Database,
         vulnerable_expected, notes, evidence = False, f"case error: {exc}", {}
     after = _seeded_finding_count(db)
     detected = after > before
-    return CaseResult(
+    result = CaseResult(
         name=case.name, trap=case.trap, detected=detected,
         classification=("trap-avoided" if (case.trap and not detected)
                         else ("hit" if detected else "miss")),
         notes=notes, evidence=evidence,
     )
+    if case.trap and detected:
+        # M5e: a fired trap is a regression — store it as a lesson so the
+        # next hunt avoids the pattern that produced it
+        from .hunt.lessons import signature_of
+        try:
+            db.add_lesson(
+                signature=signature_of(case.finding_type, case.url, case.param),
+                lesson=f"benchmark trap '{case.name}' fired — {case.description}",
+                source="bench-trap", host="",
+            )
+        except Exception:  # noqa: BLE001 — feedback never breaks scoring
+            pass
+    return result
 
 
 def run_benchmark_suite(cases: list[BenchCase], client: EnforcingClient,
